@@ -17,12 +17,20 @@ TICK_FIELD = "tick"
 MODE_FIELD = "mode"
 ID_FIELD = "id"
 
+PLAYBACK_PLAN_FIELD = "playback_plan"
+START_TICK_FIELD = "start_tick"
+END_TICK_FIELD = "end_tick"
+REPEATS_FIELD = "repeats"
+
 MODE_CONSTANT = "constant"
 MODE_LINEAR = "linear"
 VALID_MODES = (MODE_CONSTANT, MODE_LINEAR)
 
 MAX_TEMPO_POINTS = 500
 MAX_CUES = 2000
+MAX_PLAYBACK_ENTRIES = 64
+MAX_REPEATS = 16
+MAX_OCCURRENCES = 5000
 
 
 class TimelineError(Exception):
@@ -67,7 +75,13 @@ def validate_and_project(payload: Any) -> tuple[int, dict[str, Any]]:
             }
         }
 
-    known_fields = {"ticks_per_quarter", "sample_rate", "tempo_points", "cues"}
+    known_fields = {
+        "ticks_per_quarter",
+        "sample_rate",
+        "tempo_points",
+        "cues",
+        PLAYBACK_PLAN_FIELD,
+    }
     for field in payload:
         if field not in known_fields:
             errors.append(_err("UNKNOWN_FIELD", f"/{field}", "unexpected field"))
@@ -321,6 +335,165 @@ def validate_and_project(payload: Any) -> tuple[int, dict[str, Any]]:
             else:
                 cues.append(None)
 
+    # Parse the optional playback plan.  Entries may reorder, overlap and
+    # repeat the score; repeats expand an entry into consecutive passes over
+    # the same half-open tick interval [start_tick, end_tick).
+    raw_plan = payload.get(PLAYBACK_PLAN_FIELD)
+    plan_present = PLAYBACK_PLAN_FIELD in payload
+    plan: list[tuple[int, int, int] | None] = []
+    if plan_present:
+        base_path = f"/{PLAYBACK_PLAN_FIELD}"
+        if not isinstance(raw_plan, list):
+            errors.append(_err("INVALID_TYPE", base_path, "expected array"))
+        elif not 1 <= len(raw_plan) <= MAX_PLAYBACK_ENTRIES:
+            errors.append(
+                _err(
+                    "INVALID_COUNT",
+                    base_path,
+                    f"expected between 1 and {MAX_PLAYBACK_ENTRIES} playback entries",
+                )
+            )
+        else:
+            entry_fields = {START_TICK_FIELD, END_TICK_FIELD, REPEATS_FIELD}
+            for index, raw_entry in enumerate(raw_plan):
+                base = f"{base_path}/{index}"
+                if not isinstance(raw_entry, dict):
+                    errors.append(_err("INVALID_TYPE", base, "expected object"))
+                    plan.append(None)
+                    continue
+                for field in raw_entry:
+                    if field not in entry_fields:
+                        errors.append(
+                            _err(
+                                "UNKNOWN_FIELD", f"{base}/{field}", "unexpected field"
+                            )
+                        )
+
+                start_tick = raw_entry.get(START_TICK_FIELD)
+                end_tick = raw_entry.get(END_TICK_FIELD)
+                repeats = raw_entry.get(REPEATS_FIELD)
+
+                start_ok = False
+                if START_TICK_FIELD not in raw_entry:
+                    errors.append(
+                        _err(
+                            "MISSING_FIELD",
+                            f"{base}/{START_TICK_FIELD}",
+                            "field is required",
+                        )
+                    )
+                elif not _is_int(start_tick):
+                    errors.append(
+                        _err(
+                            "INVALID_TYPE",
+                            f"{base}/{START_TICK_FIELD}",
+                            "expected integer",
+                        )
+                    )
+                elif start_tick < 0:
+                    errors.append(
+                        _err(
+                            "PLAYBACK_RANGE",
+                            f"{base}/{START_TICK_FIELD}",
+                            "start tick must be non-negative",
+                        )
+                    )
+                else:
+                    start_ok = True
+
+                end_ok = False
+                if END_TICK_FIELD not in raw_entry:
+                    errors.append(
+                        _err(
+                            "MISSING_FIELD",
+                            f"{base}/{END_TICK_FIELD}",
+                            "field is required",
+                        )
+                    )
+                elif not _is_int(end_tick):
+                    errors.append(
+                        _err(
+                            "INVALID_TYPE",
+                            f"{base}/{END_TICK_FIELD}",
+                            "expected integer",
+                        )
+                    )
+                elif start_ok and end_tick <= start_tick:
+                    errors.append(
+                        _err(
+                            "INVALID_INTERVAL",
+                            f"{base}/{END_TICK_FIELD}",
+                            "end tick must be strictly greater than start tick",
+                        )
+                    )
+                elif not start_ok and end_tick < 0:
+                    errors.append(
+                        _err(
+                            "PLAYBACK_RANGE",
+                            f"{base}/{END_TICK_FIELD}",
+                            "end tick must be non-negative",
+                        )
+                    )
+                else:
+                    end_ok = True
+
+                repeats_ok = False
+                if REPEATS_FIELD not in raw_entry:
+                    errors.append(
+                        _err(
+                            "MISSING_FIELD",
+                            f"{base}/{REPEATS_FIELD}",
+                            "field is required",
+                        )
+                    )
+                elif not _is_int(repeats):
+                    errors.append(
+                        _err(
+                            "INVALID_TYPE",
+                            f"{base}/{REPEATS_FIELD}",
+                            "expected integer",
+                        )
+                    )
+                elif not 1 <= repeats <= MAX_REPEATS:
+                    errors.append(
+                        _err(
+                            "PLAYBACK_RANGE",
+                            f"{base}/{REPEATS_FIELD}",
+                            f"repeats must be between 1 and {MAX_REPEATS}",
+                        )
+                    )
+                else:
+                    repeats_ok = True
+
+                if start_ok and end_ok and repeats_ok:
+                    plan.append((start_tick, end_tick, repeats))
+                else:
+                    plan.append(None)
+
+            # Count the cues falling inside each valid interval, without
+            # projecting anything, to enforce the expansion cap up front.
+            valid_cues = [cue for cue in cues if cue is not None]
+            matched = 0
+            for entry in plan:
+                if entry is None:
+                    continue
+                start_tick, end_tick, repeats = entry
+                hits = sum(
+                    1
+                    for _cue_id, cue_tick in valid_cues
+                    if start_tick <= cue_tick < end_tick
+                )
+                matched += hits * repeats
+            if matched > MAX_OCCURRENCES:
+                errors.append(
+                    _err(
+                        "PLAYBACK_TOO_LARGE",
+                        base_path,
+                        f"expanded playback plan must not exceed "
+                        f"{MAX_OCCURRENCES} occurrences",
+                    )
+                )
+
     if errors:
         return 400, {
             "error": {
@@ -336,13 +509,29 @@ def validate_and_project(payload: Any) -> tuple[int, dict[str, Any]]:
     assert isinstance(raw_points, list)
     assert isinstance(raw_cues, list)
 
-    projected = _project(
+    valid_points = [point for point in points if point is not None]
+    valid_cues = [cue for cue in cues if cue is not None]
+
+    if not plan_present:
+        projected = _project(
+            ticks_per_quarter=ticks_per_quarter,
+            sample_rate=sample_rate,
+            points=valid_points,
+            cues=valid_cues,
+        )
+        return 200, {"ticks_per_quarter": ticks_per_quarter, "cues": projected}
+
+    occurrences = _project_playback(
         ticks_per_quarter=ticks_per_quarter,
         sample_rate=sample_rate,
-        points=[point for point in points if point is not None],
-        cues=[cue for cue in cues if cue is not None],
+        points=valid_points,
+        cues=valid_cues,
+        plan=[entry for entry in plan if entry is not None],
     )
-    return 200, {"ticks_per_quarter": ticks_per_quarter, "cues": projected}
+    return 200, {
+        "ticks_per_quarter": ticks_per_quarter,
+        "occurrences": occurrences,
+    }
 
 
 def _project(
@@ -408,5 +597,90 @@ def _project(
                 "sample_frame": sample_frame,
             }
         )
+
+    return results
+
+
+def _project_playback(
+    *,
+    ticks_per_quarter: int,
+    sample_rate: int,
+    points: list[tuple[int, int, str]],
+    cues: list[tuple[Any, int]],
+    plan: list[tuple[int, int, int]],
+) -> list[dict[str, Any]]:
+    """Project cues along an arbitrary playback path onto one continuous clock.
+
+    ``points`` are validated, ordered and start at tick 0; ``plan`` entries are
+    validated ``(start_tick, end_tick, repeats)`` triples.  Every pass covers
+    the half-open interval ``[start_tick, end_tick)``; passes of the same
+    entry are played back to back.  The output clock only ever advances, even
+    when the plan jumps backwards or repeats material, and its running value
+    is never rounded -- the nanosecond and frame integers are rounded once,
+    when each occurrence is emitted.
+    """
+    ticks = [point[0] for point in points]
+    tempos = [point[1] for point in points]
+    modes = [point[2] for point in points]
+
+    # Exact cumulative microseconds at every tempo point.
+    cumulative: list[Fraction] = [Fraction(0)]
+    for i in range(len(points) - 1):
+        a, b = ticks[i], ticks[i + 1]
+        span = b - a
+        if modes[i] == MODE_CONSTANT:
+            segment = Fraction(tempos[i] * span, ticks_per_quarter)
+        else:
+            segment = Fraction((tempos[i] + tempos[i + 1]) * span, 2 * ticks_per_quarter)
+        cumulative.append(cumulative[-1] + segment)
+
+    last_index = len(points) - 1
+
+    def elapsed_at(score_tick: int) -> Fraction:
+        """Exact score-relative microseconds at ``score_tick``."""
+        index = bisect_right(ticks, score_tick) - 1
+        a = ticks[index]
+        elapsed: Fraction = cumulative[index]
+        if score_tick > a:
+            distance = score_tick - a
+            if index == last_index or modes[index] == MODE_CONSTANT:
+                elapsed += Fraction(tempos[index] * distance, ticks_per_quarter)
+            else:
+                b = ticks[index + 1]
+                average = tempos[index] + Fraction(
+                    (tempos[index + 1] - tempos[index]) * distance, 2 * (b - a)
+                )
+                elapsed += average * Fraction(distance, ticks_per_quarter)
+        return elapsed
+
+    rate = Fraction(sample_rate, 1_000_000)
+    results: list[dict[str, Any]] = []
+    clock = Fraction(0)
+
+    for entry_index, (start_tick, end_tick, repeats) in enumerate(plan):
+        pass_duration = elapsed_at(end_tick) - elapsed_at(start_tick)
+        interval_start = elapsed_at(start_tick)
+        matched = [
+            (cue_id, cue_tick)
+            for cue_id, cue_tick in cues
+            if start_tick <= cue_tick < end_tick
+        ]
+        for repeat_index in range(repeats):
+            for cue_id, cue_tick in matched:
+                # Offset inside the pass follows the same tempo curve as the
+                # ordinary projection; nothing is rounded before this point.
+                elapsed = clock + (elapsed_at(cue_tick) - interval_start)
+                results.append(
+                    {
+                        ID_FIELD: cue_id,
+                        TICK_FIELD: cue_tick,
+                        "entry_index": entry_index,
+                        "repeat_index": repeat_index,
+                        "time_nanoseconds": _round_half_even(elapsed * 1000),
+                        "sample_frame": _round_half_even(elapsed * rate),
+                    }
+                )
+            # Advance the continuous clock even when the pass had no cues.
+            clock += pass_duration
 
     return results

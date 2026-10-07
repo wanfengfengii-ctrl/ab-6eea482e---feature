@@ -4,8 +4,9 @@ Steps, in order:
   1. wait for the application's health endpoint to report ready;
   2. byte-compile every source file (build check);
   3. run the full unit test suite;
-  4. run API smoke tests covering constant and linear-ramp segments plus a
-     validation-failure case;
+  4. run API smoke tests covering constant and linear-ramp segments,
+     playback-plan projection (repeats, backwards jumps, cueless passes) and
+     playback-plan validation failures, plus a validation-failure case;
   5. exit non-zero if anything failed so ``docker compose up`` reports it.
 """
 
@@ -155,6 +156,105 @@ def smoke_linear_segment() -> bool:
     return True
 
 
+def smoke_playback_plan() -> bool:
+    payload = {
+        "ticks_per_quarter": 480,
+        "sample_rate": 48000,
+        "tempo_points": [
+            {"tick": 0, "microseconds_per_quarter": 500000, "mode": "constant"}
+        ],
+        "cues": [
+            {"id": "a", "tick": 0},
+            {"id": "b", "tick": 480},
+            {"id": "c", "tick": 960},
+        ],
+        # Rehearsal path: [0,960) twice, then jump back to [0,480), then a
+        # cueless bridging pass [2000,2480), then [960,1440).
+        "playback_plan": [
+            {"start_tick": 0, "end_tick": 960, "repeats": 2},
+            {"start_tick": 0, "end_tick": 480, "repeats": 1},
+            {"start_tick": 2000, "end_tick": 2480, "repeats": 1},
+            {"start_tick": 960, "end_tick": 1440, "repeats": 1},
+        ],
+    }
+    status, body = post(payload)
+    if status != 200:
+        print(f"[verify] playback smoke expected 200, got {status}: {body}")
+        return False
+    if "cues" in body or "occurrences" not in body:
+        print("[verify] playback smoke used the wrong response shape")
+        return False
+    occ = body["occurrences"]
+    # Pass lengths at 500000us/quarter: [0,960)=1.0s x2, [0,480)=0.5s,
+    # [2000,2480)=0.5s (no cues; must still carry), [960,1440)=0.5s.
+    expected = [
+        ("a", 0, 0, 0, 0, 0),
+        ("b", 480, 0, 0, 500_000_000, 24_000),
+        ("a", 0, 0, 1, 1_000_000_000, 48_000),
+        ("b", 480, 0, 1, 1_500_000_000, 72_000),
+        ("a", 0, 1, 0, 2_000_000_000, 96_000),
+        # 0.5s cueless pass carries the clock to 3.0s before the final entry.
+        ("c", 960, 3, 0, 3_000_000_000, 144_000),
+    ]
+    actual = [
+        (o["id"], o["tick"], o["entry_index"], o["repeat_index"],
+         o["time_nanoseconds"], o["sample_frame"])
+        for o in occ
+    ]
+    if actual != expected:
+        print(f"[verify] playback occurrences mismatch:\n{actual}\n!=\n{expected}")
+        return False
+    times = [o["time_nanoseconds"] for o in occ]
+    if times != sorted(times):
+        print("[verify] playback clock moved backwards")
+        return False
+    print("[verify] playback-plan smoke OK")
+    return True
+
+
+def smoke_playback_plan_rejected() -> bool:
+    payload = {
+        "ticks_per_quarter": 480,
+        "sample_rate": 48000,
+        "tempo_points": [
+            {"tick": 0, "microseconds_per_quarter": 500000, "mode": "constant"}
+        ],
+        "cues": [{"id": "a", "tick": 0}],
+        "playback_plan": [
+            {"start_tick": 10, "end_tick": 10, "repeats": 1},
+            {"start_tick": 0, "end_tick": 1, "repeats": 17},
+        ],
+    }
+    status, body = post(payload)
+    if status != 400:
+        print(f"[verify] playback rejection smoke expected 400, got {status}: {body}")
+        return False
+    if "occurrences" in body or "cues" in body:
+        print("[verify] error response leaked partial projections")
+        return False
+    codes = {error["code"] for error in body["error"]["errors"]}
+    for required in ("INVALID_INTERVAL", "PLAYBACK_RANGE"):
+        if required not in codes:
+            print(f"[verify] playback rejection smoke missing code {required}: {codes}")
+            return False
+
+    # Expansion over the 5000-occurrence cap must fail atomically.
+    payload["playback_plan"] = [
+        {"start_tick": 0, "end_tick": 1000, "repeats": 16}
+    ]
+    payload["cues"] = [{"id": i, "tick": i} for i in range(313)]
+    status, body = post(payload)
+    if status != 400:
+        print(f"[verify] playback cap smoke expected 400, got {status}: {body}")
+        return False
+    codes = {error["code"] for error in body["error"]["errors"]}
+    if "PLAYBACK_TOO_LARGE" not in codes:
+        print(f"[verify] playback cap smoke missing PLAYBACK_TOO_LARGE: {codes}")
+        return False
+    print("[verify] playback-plan rejection smoke OK")
+    return True
+
+
 def smoke_validation_rejected() -> bool:
     payload = {
         "ticks_per_quarter": 480,
@@ -188,6 +288,8 @@ def main() -> int:
         ("unit tests", run_unit_tests),
         ("constant smoke", smoke_constant_segment),
         ("linear smoke", smoke_linear_segment),
+        ("playback-plan smoke", smoke_playback_plan),
+        ("playback-plan rejection smoke", smoke_playback_plan_rejected),
         ("validation smoke", smoke_validation_rejected),
     ]
     failures = []

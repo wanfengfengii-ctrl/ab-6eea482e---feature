@@ -90,6 +90,54 @@ class HttpApiTests(unittest.TestCase):
         self.assertIn("NON_POSITIVE_TEMPO", codes)
         self.assertIn("INVALID_MODE", codes)
 
+    def test_playback_plan_repeats_on_continuous_clock(self):
+        body = dict(GOOD_BODY)
+        body["cues"] = [
+            {"id": "a", "tick": 0},
+            {"id": "b", "tick": 480},
+            {"id": "c", "tick": 960},
+        ]
+        # Half-open [0, 960) repeated twice: cue c is excluded from both.
+        body["playback_plan"] = [
+            {"start_tick": 0, "end_tick": 960, "repeats": 2},
+            {"start_tick": 960, "end_tick": 1440, "repeats": 1},
+        ]
+        status, resp = request(
+            "POST", "/api/timelines/project", json.dumps(body).encode()
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn("cues", resp)
+        occ = resp["occurrences"]
+        self.assertEqual(
+            [
+                (o["id"], o["tick"], o["entry_index"], o["repeat_index"],
+                 o["time_nanoseconds"], o["sample_frame"])
+                for o in occ
+            ],
+            [
+                ("a", 0, 0, 0, 0, 0),
+                ("b", 480, 0, 0, 500_000_000, 24_000),
+                ("a", 0, 0, 1, 1_000_000_000, 48_000),
+                ("b", 480, 0, 1, 1_500_000_000, 72_000),
+                ("c", 960, 1, 0, 2_000_000_000, 96_000),
+            ],
+        )
+
+    def test_playback_plan_validation_error_is_400(self):
+        body = dict(GOOD_BODY)
+        body["playback_plan"] = [{"start_tick": 10, "end_tick": 10, "repeats": 3}]
+        status, resp = request(
+            "POST", "/api/timelines/project", json.dumps(body).encode()
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(resp["error"]["code"], "VALIDATION_FAILED")
+        self.assertNotIn("occurrences", resp)
+        self.assertNotIn("cues", resp)
+        errors = {(e["code"], e["path"]) for e in resp["error"]["errors"]}
+        self.assertIn(
+            ("INVALID_INTERVAL", "/playback_plan/0/end_tick"), errors
+        )
+
     def test_malformed_json(self):
         status, body = request(
             "POST", "/api/timelines/project", b"{not json"

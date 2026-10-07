@@ -37,6 +37,7 @@
 | `sample_rate` | 正整数（Hz） |
 | `tempo_points` | 1–500 个；`tick` 必须从 0 开始且严格递增；`microseconds_per_quarter` 为正整数（微秒/四分音符）；`mode` 为 `constant` 或 `linear` |
 | `cues` | 1–2000 个；`id` 为非空字符串或整数且全请求唯一；`tick` 为非负整数 |
+| `playback_plan` | 可选；1–64 个条目，每项含 `start_tick`（非负整数）、`end_tick`（严格大于 `start_tick`）、`repeats`（1–16）。区间为**左闭右开**，条目可重排、重叠或重复；展开后的提示出现次数上限 5000 |
 
 语义：
 
@@ -59,6 +60,36 @@
 
 - `time_nanoseconds = round_half_even(累计微秒 × 1000)`
 - `sample_frame = round_half_even(累计微秒 × sample_rate / 1_000_000)`（零基帧）
+
+### 排练播放计划（可选 `playback_plan`）
+
+排练时同一份乐谱可能被跳播或重复。提供 `playback_plan` 后，服务把每个条目
+展开为沿**一条连续时钟**播放的若干轮次：
+
+- 条目依次播放；每条目按 `repeats` 连续回放其左闭右开区间
+  `[start_tick, end_tick)`（故恰在 `end_tick` 上的提示不出现）。
+- 条目之间允许回跳、重叠、重复；无论乐谱相对位置如何，输出时钟只增不减。
+- 每个条目的时长与片内偏移沿用同一条速度曲线（含 `linear` 段的梯形积分）。
+- 连续时钟以未舍入的 `Fraction` 贯穿所有条目与轮次——**即使某个区间内没有
+  任何提示，其精确时长也向后传递**；纳秒与采样帧只在每条 occurrence 输出前
+  按半偶规则取整一次。
+
+启用计划后，200 响应以 `occurrences` 取代 `cues`，按条目顺序、轮次和原提示
+顺序排列；每项在原有四个字段之外增加零基 `entry_index` 与 `repeat_index`：
+
+```json
+{
+  "ticks_per_quarter": 480,
+  "occurrences": [
+    {"id": "a", "tick": 0,   "entry_index": 0, "repeat_index": 0, "time_nanoseconds": 0,          "sample_frame": 0},
+    {"id": "b", "tick": 480, "entry_index": 0, "repeat_index": 0, "time_nanoseconds": 500000000,  "sample_frame": 24000},
+    {"id": "a", "tick": 0,   "entry_index": 0, "repeat_index": 1, "time_nanoseconds": 1000000000, "sample_frame": 48000}
+  ]
+}
+```
+
+省略 `playback_plan` 时请求、响应（仍为 `cues`）、错误顺序及数值与旧版完全
+一致；显式传 `null` 等非法值按常规校验失败处理。
 
 健康检查：`GET /health` → `200 {"status":"ok"}`（同时提供 `/healthz`、`/ready`）。
 
@@ -86,9 +117,12 @@
 ```
 
 其他错误码：`MISSING_FIELD`、`INVALID_TYPE`（JSON 布尔值不接受为整数）、
-`INVALID_COUNT`、`UNKNOWN_FIELD`，以及传输层的 `MALFORMED_JSON`、
-`EMPTY_BODY`、`BODY_TOO_LARGE`、`NOT_FOUND`。同一请求产生的错误集合与顺序是
-确定性的，可用于稳定比对。
+`INVALID_COUNT`、`UNKNOWN_FIELD`，以及播放计划专用的 `PLAYBACK_RANGE`
+（`start_tick` 为负或 `repeats` 超出 1–16）、`INVALID_INTERVAL`
+（`end_tick` 不严格大于 `start_tick`）、`PLAYBACK_TOO_LARGE`
+（展开后超过 5000 项，`path` 指向 `/playback_plan`），和传输层的
+`MALFORMED_JSON`、`EMPTY_BODY`、`BODY_TOO_LARGE`、`NOT_FOUND`。同一请求
+产生的错误集合与顺序是确定性的，可用于稳定比对。
 
 ## 本地运行（无需 Docker）
 
@@ -104,7 +138,8 @@ python3 -m unittest discover -s tests -t .
 HOST_PORT=9090 docker compose up -d app
 
 # 一次性 verify 服务：等待 app 健康后，依次执行
-# 构建（字节码编译）、全部单元测试、恒定段/渐变段/错误请求 API 冒烟，
+# 构建（字节码编译）、全部单元测试、恒定段/渐变段/播放计划（含回跳、重复、
+# 无提示片段）/播放计划非法请求/错误请求 API 冒烟，
 # 随后自行退出，退出码即结果（0 成功）。
 docker compose up --abort-on-container-exit --exit-code-from verify verify
 ```
