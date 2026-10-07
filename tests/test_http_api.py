@@ -97,6 +97,51 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["code"], "MALFORMED_JSON")
 
+    def test_playback_plan_projection(self):
+        body = dict(GOOD_BODY)
+        body["cues"] = [
+            {"id": "a", "tick": 0}, {"id": "b", "tick": 480}
+        ]
+        body["playback_plan"] = [
+            {"start_tick": 0, "end_tick": 480, "repeats": 2},
+            {"start_tick": 480, "end_tick": 960, "repeats": 1},
+        ]
+        status, resp = request(
+            "POST", "/api/timelines/project", json.dumps(body).encode()
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn("cues", resp)
+        self.assertEqual(
+            [(o["id"], o["plan_entry"], o["repeat"], o["time_nanoseconds"])
+             for o in resp["occurrences"]],
+            [
+                ("a", 0, 0, 0),
+                ("a", 0, 1, 500_000_000),
+                ("b", 1, 0, 1_000_000_000),
+            ],
+        )
+
+    def test_playback_plan_validation_error_is_400(self):
+        body = dict(GOOD_BODY)
+        body["playback_plan"] = [
+            {"start_tick": 480, "end_tick": 240, "repeats": 17}
+        ]
+        status, resp = request(
+            "POST", "/api/timelines/project", json.dumps(body).encode()
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(resp["error"]["code"], "VALIDATION_FAILED")
+        self.assertNotIn("occurrences", resp)
+        codes_paths = {
+            (e["code"], e["path"]) for e in resp["error"]["errors"]
+        }
+        self.assertIn(
+            ("INVALID_INTERVAL", "/playback_plan/0/end_tick"), codes_paths
+        )
+        self.assertIn(
+            ("REPEATS_OUT_OF_RANGE", "/playback_plan/0/repeats"), codes_paths
+        )
+
     def test_unknown_route(self):
         status, _ = request("POST", "/nope", b"{}")
         self.assertEqual(status, 404)

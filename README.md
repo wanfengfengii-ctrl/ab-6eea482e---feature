@@ -62,6 +62,62 @@
 
 健康检查：`GET /health` → `200 {"status":"ok"}`（同时提供 `/healthz`、`/ready`）。
 
+## 回放计划（playback_plan，可选）
+
+排练时可能跳播（D.S.、反复）或重复某段乐谱。请求可带可选字段 `playback_plan`；
+**省略时请求、响应、错误顺序与数值与以前完全一致**。给出后，提示点不再按绝对
+乐谱时刻投影，而是沿实际播放路径投影到一条**始终连续、不倒退**的时钟，响应以
+`occurrences`（而非 `cues`）返回：
+
+```json
+{
+  "ticks_per_quarter": 480,
+  "sample_rate": 48000,
+  "tempo_points": [
+    {"tick": 0, "microseconds_per_quarter": 500000, "mode": "constant"}
+  ],
+  "cues": [
+    {"id": "a", "tick": 0},
+    {"id": "b", "tick": 480}
+  ],
+  "playback_plan": [
+    {"start_tick": 0,   "end_tick": 480, "repeats": 2},
+    {"start_tick": 480, "end_tick": 960, "repeats": 1}
+  ]
+}
+```
+
+```json
+{
+  "ticks_per_quarter": 480,
+  "occurrences": [
+    {"id": "a", "tick": 0,   "plan_entry": 0, "repeat": 0, "time_nanoseconds": 0,          "sample_frame": 0},
+    {"id": "a", "tick": 0,   "plan_entry": 0, "repeat": 1, "time_nanoseconds": 500000000,  "sample_frame": 24000},
+    {"id": "b", "tick": 480, "plan_entry": 1, "repeat": 0, "time_nanoseconds": 1000000000, "sample_frame": 48000}
+  ]
+}
+```
+
+计划约束：
+
+| 字段 | 约束 |
+| --- | --- |
+| `playback_plan` | 1–64 个条目；条目按请求顺序播放，允许重排、重叠或完全重复 |
+| `start_tick` / `end_tick` | 非负整数，`end_tick` 严格大于 `start_tick`；区间左闭右开 `[start_tick, end_tick)` |
+| `repeats` | 1–16 的整数 |
+| 展开上限 | 展开后的提示出现次数（各条目 `repeats` × 落在区间内的 cue 数之和）不得超过 5000 |
+
+语义：
+
+- 排序为「条目顺序 → 零基轮次（repeat）→ 提示在原请求中的顺序」。落在区间
+  `[start_tick, end_tick)` 内的提示才出现；恰在 `end_tick` 的提示属于下一段。
+- 每个区间时长与片内偏移沿用既有速度曲线（含 linear 渐变），全部用 `Fraction`
+  精确计算。**未舍入的累计时钟会跨无提示片段、回跳和重复继续传递**；纳秒与帧
+  只在最终输出时各自按半偶规则取整一次，因此输出时钟严格单调不减。
+- 合法的回跳（如先播 `[480,960)` 再播 `[0,480)`）只是在输出时钟后再接一段
+  该区间的时长，不会令时钟倒退。
+- `playback_plan` 启用时响应不含 `cues`；省略时响应不含 `occurrences`。
+
 ## 错误处理
 
 任何字段级或结构级错误都使**整个请求失败（HTTP 400），响应绝不夹带部分投影
@@ -87,8 +143,13 @@
 
 其他错误码：`MISSING_FIELD`、`INVALID_TYPE`（JSON 布尔值不接受为整数）、
 `INVALID_COUNT`、`UNKNOWN_FIELD`，以及传输层的 `MALFORMED_JSON`、
-`EMPTY_BODY`、`BODY_TOO_LARGE`、`NOT_FOUND`。同一请求产生的错误集合与顺序是
-确定性的，可用于稳定比对。
+`EMPTY_BODY`、`BODY_TOO_LARGE`、`NOT_FOUND`。回放计划另有
+`PLAN_TICK_OUT_OF_RANGE`（start/end 为负，指针指向对应字段）、
+`INVALID_INTERVAL`（`end_tick <= start_tick`，指针指向 `end_tick`）、
+`REPEATS_OUT_OF_RANGE`（repeats 超出 1–16）和 `PLAN_TOO_LARGE`
+（展开超过 5000 个出现，指针指向 `/playback_plan`）。同一请求产生的错误集合与
+顺序是确定性的，可用于稳定比对。计划字段非法、区间无效或展开超限时整个请求
+失败，且不返回任何 `occurrences`。
 
 ## 本地运行（无需 Docker）
 
@@ -104,7 +165,8 @@ python3 -m unittest discover -s tests -t .
 HOST_PORT=9090 docker compose up -d app
 
 # 一次性 verify 服务：等待 app 健康后，依次执行
-# 构建（字节码编译）、全部单元测试、恒定段/渐变段/错误请求 API 冒烟，
+# 构建（字节码编译）、全部单元测试、恒定段/渐变段/错误请求，以及回放计划
+# （重复、回跳、计划非法）的新旧 API 冒烟，
 # 随后自行退出，退出码即结果（0 成功）。
 docker compose up --abort-on-container-exit --exit-code-from verify verify
 ```

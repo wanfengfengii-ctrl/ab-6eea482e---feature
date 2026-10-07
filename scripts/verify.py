@@ -4,8 +4,9 @@ Steps, in order:
   1. wait for the application's health endpoint to report ready;
   2. byte-compile every source file (build check);
   3. run the full unit test suite;
-  4. run API smoke tests covering constant and linear-ramp segments plus a
-     validation-failure case;
+  4. run API smoke tests covering constant and linear-ramp segments, a
+     validation-failure case, and the playback-plan API (repeats/backward
+     jumps plus a plan-validation failure);
   5. exit non-zero if anything failed so ``docker compose up`` reports it.
 """
 
@@ -181,6 +182,92 @@ def smoke_validation_rejected() -> bool:
     return True
 
 
+def smoke_playback_plan() -> bool:
+    # Repeats and a backward jump: the output clock must stay continuous and
+    # never move backwards, even though the score tick jumps around.
+    payload = {
+        "ticks_per_quarter": 480,
+        "sample_rate": 48000,
+        "tempo_points": [
+            {"tick": 0, "microseconds_per_quarter": 500000, "mode": "constant"},
+            {"tick": 480, "microseconds_per_quarter": 250000, "mode": "constant"},
+        ],
+        "cues": [
+            {"id": "a", "tick": 0},
+            {"id": "b", "tick": 480},
+            {"id": "c", "tick": 960},
+        ],
+        "playback_plan": [
+            # [0,480) twice: 0.5s each; only cue a lives in this interval.
+            {"start_tick": 0, "end_tick": 480, "repeats": 2},
+            # [480,960) once: 0.25s; cue b at its start, total now 1.25s.
+            {"start_tick": 480, "end_tick": 960, "repeats": 1},
+            # Backward jump back to [0,480): another 0.5s, clock never
+            # reverses; cue a is projected again at 1.25s.
+            {"start_tick": 0, "end_tick": 480, "repeats": 1},
+        ],
+    }
+    status, body = post(payload)
+    if status != 200:
+        print(f"[verify] playback-plan smoke expected 200, got {status}: {body}")
+        return False
+    if "cues" in body or "occurrences" not in body:
+        print("[verify] playback-plan response has the wrong shape")
+        return False
+    occurrences = body["occurrences"]
+    expected = [
+        ("a", 0, 0, 0),
+        ("a", 0, 1, 500_000_000),
+        ("b", 1, 0, 1_000_000_000),
+        ("a", 2, 0, 1_250_000_000),
+    ]
+    actual = [
+        (o["id"], o["plan_entry"], o["repeat"], o["time_nanoseconds"])
+        for o in occurrences
+    ]
+    if actual != expected:
+        print(f"[verify] playback-plan occurrences mismatch: {actual}")
+        return False
+    nanos = [o["time_nanoseconds"] for o in occurrences]
+    frames = [o["sample_frame"] for o in occurrences]
+    if nanos != sorted(nanos) or frames != sorted(frames):
+        print("[verify] playback-plan output clock moved backwards")
+        return False
+    print("[verify] playback-plan smoke OK")
+    return True
+
+
+def smoke_playback_plan_rejected() -> bool:
+    payload = {
+        "ticks_per_quarter": 480,
+        "sample_rate": 48000,
+        "tempo_points": [
+            {"tick": 0, "microseconds_per_quarter": 500000, "mode": "constant"}
+        ],
+        "cues": [{"id": "a", "tick": 0}],
+        "playback_plan": [
+            {"start_tick": 480, "end_tick": 240, "repeats": 17}
+        ],
+    }
+    status, body = post(payload)
+    if status != 400:
+        print(f"[verify] plan-validation smoke expected 400, got {status}: {body}")
+        return False
+    if "occurrences" in body or "cues" in body:
+        print("[verify] plan error response leaked partial results")
+        return False
+    codes_paths = {(e["code"], e["path"]) for e in body["error"]["errors"]}
+    for required in (
+        ("INVALID_INTERVAL", "/playback_plan/0/end_tick"),
+        ("REPEATS_OUT_OF_RANGE", "/playback_plan/0/repeats"),
+    ):
+        if required not in codes_paths:
+            print(f"[verify] plan-validation smoke missing {required}: {codes_paths}")
+            return False
+    print("[verify] playback-plan validation-failure smoke OK")
+    return True
+
+
 def main() -> int:
     steps = [
         ("readiness", wait_for_ready),
@@ -189,6 +276,8 @@ def main() -> int:
         ("constant smoke", smoke_constant_segment),
         ("linear smoke", smoke_linear_segment),
         ("validation smoke", smoke_validation_rejected),
+        ("playback-plan smoke", smoke_playback_plan),
+        ("playback-plan validation smoke", smoke_playback_plan_rejected),
     ]
     failures = []
     for name, step in steps:

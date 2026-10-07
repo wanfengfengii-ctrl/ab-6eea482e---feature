@@ -8,7 +8,7 @@ rounded once, at the end, using round-half-to-even ("banker's rounding").
 
 from __future__ import annotations
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from fractions import Fraction
 from typing import Any
 
@@ -17,12 +17,23 @@ TICK_FIELD = "tick"
 MODE_FIELD = "mode"
 ID_FIELD = "id"
 
+PLAYBACK_PLAN_FIELD = "playback_plan"
+START_TICK_FIELD = "start_tick"
+END_TICK_FIELD = "end_tick"
+REPEATS_FIELD = "repeats"
+PLAN_ENTRY_FIELD = "plan_entry"
+REPEAT_FIELD = "repeat"
+OCCURRENCES_FIELD = "occurrences"
+
 MODE_CONSTANT = "constant"
 MODE_LINEAR = "linear"
 VALID_MODES = (MODE_CONSTANT, MODE_LINEAR)
 
 MAX_TEMPO_POINTS = 500
 MAX_CUES = 2000
+MAX_PLAN_ENTRIES = 64
+MAX_REPEATS = 16
+MAX_OCCURRENCES = 5000
 
 
 class TimelineError(Exception):
@@ -67,7 +78,13 @@ def validate_and_project(payload: Any) -> tuple[int, dict[str, Any]]:
             }
         }
 
-    known_fields = {"ticks_per_quarter", "sample_rate", "tempo_points", "cues"}
+    known_fields = {
+        "ticks_per_quarter",
+        "sample_rate",
+        "tempo_points",
+        "cues",
+        PLAYBACK_PLAN_FIELD,
+    }
     for field in payload:
         if field not in known_fields:
             errors.append(_err("UNKNOWN_FIELD", f"/{field}", "unexpected field"))
@@ -321,6 +338,116 @@ def validate_and_project(payload: Any) -> tuple[int, dict[str, Any]]:
             else:
                 cues.append(None)
 
+    # Parse the optional playback plan.
+    plan_enabled = PLAYBACK_PLAN_FIELD in payload
+    raw_plan = payload.get(PLAYBACK_PLAN_FIELD)
+    plan_entries: list[tuple[int, int, int] | None] = []
+    if plan_enabled:
+        if not isinstance(raw_plan, list):
+            errors.append(
+                _err("INVALID_TYPE", f"/{PLAYBACK_PLAN_FIELD}", "expected array")
+            )
+        elif not 1 <= len(raw_plan) <= MAX_PLAN_ENTRIES:
+            errors.append(
+                _err(
+                    "INVALID_COUNT",
+                    f"/{PLAYBACK_PLAN_FIELD}",
+                    f"expected between 1 and {MAX_PLAN_ENTRIES} playback plan entries",
+                )
+            )
+        else:
+            entry_fields = {START_TICK_FIELD, END_TICK_FIELD, REPEATS_FIELD}
+            for entry_index, raw_entry in enumerate(raw_plan):
+                base = f"/{PLAYBACK_PLAN_FIELD}/{entry_index}"
+                if not isinstance(raw_entry, dict):
+                    errors.append(_err("INVALID_TYPE", base, "expected object"))
+                    plan_entries.append(None)
+                    continue
+                for field in raw_entry:
+                    if field not in entry_fields:
+                        errors.append(
+                            _err(
+                                "UNKNOWN_FIELD", f"{base}/{field}", "unexpected field"
+                            )
+                        )
+
+                start = raw_entry.get(START_TICK_FIELD)
+                end = raw_entry.get(END_TICK_FIELD)
+                repeats = raw_entry.get(REPEATS_FIELD)
+
+                start_ok = _parse_plan_int(
+                    errors, start, START_TICK_FIELD in raw_entry, f"{base}/{START_TICK_FIELD}"
+                )
+                end_ok = _parse_plan_int(
+                    errors, end, END_TICK_FIELD in raw_entry, f"{base}/{END_TICK_FIELD}"
+                )
+                repeats_ok = False
+                if REPEATS_FIELD not in raw_entry:
+                    errors.append(
+                        _err(
+                            "MISSING_FIELD",
+                            f"{base}/{REPEATS_FIELD}",
+                            "field is required",
+                        )
+                    )
+                elif not _is_int(repeats):
+                    errors.append(
+                        _err(
+                            "INVALID_TYPE",
+                            f"{base}/{REPEATS_FIELD}",
+                            "expected integer",
+                        )
+                    )
+                elif not 1 <= repeats <= MAX_REPEATS:
+                    errors.append(
+                        _err(
+                            "REPEATS_OUT_OF_RANGE",
+                            f"{base}/{REPEATS_FIELD}",
+                            f"repeats must be between 1 and {MAX_REPEATS}",
+                        )
+                    )
+                else:
+                    repeats_ok = True
+
+                if start_ok and end_ok and end <= start:
+                    errors.append(
+                        _err(
+                            "INVALID_INTERVAL",
+                            f"{base}/{END_TICK_FIELD}",
+                            "end_tick must be strictly greater than start_tick",
+                        )
+                    )
+                    end_ok = False
+
+                if start_ok and end_ok and repeats_ok:
+                    plan_entries.append((start, end, repeats))
+                else:
+                    plan_entries.append(None)
+
+            # The expansion cap bounds the number of emitted cue occurrences
+            # (each repeat projects every cue inside that interval).  It is
+            # evaluated only when every entry and cue parsed; a structurally
+            # broken request fails on the field-level errors instead.
+            if not any(entry is None for entry in plan_entries) and not any(
+                cue is None for cue in cues
+            ):
+                valid_cue_ticks = [cue[1] for cue in cues if cue is not None]
+                total = 0
+                for start, end, repeats in plan_entries:
+                    inside = sum(
+                        1 for tick in valid_cue_ticks if start <= tick < end
+                    )
+                    total += repeats * inside
+                if total > MAX_OCCURRENCES:
+                    errors.append(
+                        _err(
+                            "PLAN_TOO_LARGE",
+                            f"/{PLAYBACK_PLAN_FIELD}",
+                            f"playback plan expands to {total} cue occurrences; "
+                            f"the limit is {MAX_OCCURRENCES}",
+                        )
+                    )
+
     if errors:
         return 400, {
             "error": {
@@ -336,66 +463,67 @@ def validate_and_project(payload: Any) -> tuple[int, dict[str, Any]]:
     assert isinstance(raw_points, list)
     assert isinstance(raw_cues, list)
 
-    projected = _project(
-        ticks_per_quarter=ticks_per_quarter,
-        sample_rate=sample_rate,
-        points=[point for point in points if point is not None],
-        cues=[cue for cue in cues if cue is not None],
+    tempo_map = TempoMap(
+        ticks_per_quarter,
+        [point for point in points if point is not None],
     )
-    return 200, {"ticks_per_quarter": ticks_per_quarter, "cues": projected}
+    parsed_cues = [cue for cue in cues if cue is not None]
+
+    if not plan_enabled:
+        projected = _project_with_map(
+            tempo_map=tempo_map,
+            sample_rate=sample_rate,
+            cues=parsed_cues,
+        )
+        return 200, {"ticks_per_quarter": ticks_per_quarter, "cues": projected}
+
+    assert isinstance(raw_plan, list)
+    occurrences = _project_plan(
+        tempo_map=tempo_map,
+        sample_rate=sample_rate,
+        cues=parsed_cues,
+        entries=[entry for entry in plan_entries if entry is not None],
+    )
+    return 200, {
+        "ticks_per_quarter": ticks_per_quarter,
+        OCCURRENCES_FIELD: occurrences,
+    }
 
 
-def _project(
+def _parse_plan_int(
+    errors: list[dict[str, str]],
+    value: Any,
+    present: bool,
+    path: str,
+) -> bool:
+    """Validate a plan tick field (non-negative integer); record any error."""
+    if not present:
+        errors.append(_err("MISSING_FIELD", path, "field is required"))
+    elif not _is_int(value):
+        errors.append(_err("INVALID_TYPE", path, "expected integer"))
+    elif value < 0:
+        errors.append(
+            _err(
+                "PLAN_TICK_OUT_OF_RANGE",
+                path,
+                "plan tick must be non-negative",
+            )
+        )
+    else:
+        return True
+    return False
+
+
+def _project_with_map(
     *,
-    ticks_per_quarter: int,
+    tempo_map: TempoMap,
     sample_rate: int,
-    points: list[tuple[int, int, str]],
     cues: list[tuple[Any, int]],
 ) -> list[dict[str, Any]]:
-    """Project cues.  ``points`` are validated, ordered and start at tick 0."""
-    tpq = Fraction(ticks_per_quarter)
-    ticks = [point[0] for point in points]
-    tempos = [point[1] for point in points]
-    modes = [point[2] for point in points]
-
-    # Exact cumulative microseconds at every tempo point.
-    cumulative: list[Fraction] = [Fraction(0)]
-    for i in range(len(points) - 1):
-        a, b = ticks[i], ticks[i + 1]
-        span = b - a
-        if modes[i] == MODE_CONSTANT:
-            segment = Fraction(tempos[i] * span, ticks_per_quarter)
-        else:
-            # Trapezoid: tempo ramps linearly from tempos[i] to tempos[i+1].
-            segment = Fraction((tempos[i] + tempos[i + 1]) * span, 2 * ticks_per_quarter)
-        cumulative.append(cumulative[-1] + segment)
-
-    last_index = len(points) - 1
+    """Project cues without a playback plan (legacy response shape)."""
     results: list[dict[str, Any]] = []
-
     for cue_id, cue_tick in cues:
-        index = bisect_right(ticks, cue_tick) - 1
-        a = ticks[index]
-        tempo_a = tempos[index]
-        elapsed: Fraction = cumulative[index]
-
-        if cue_tick > a:
-            distance = cue_tick - a
-            if index == last_index or modes[index] == MODE_CONSTANT:
-                # Last point holds its tempo forever.
-                elapsed += Fraction(tempo_a * distance, ticks_per_quarter)
-            else:
-                b = ticks[index + 1]
-                tempo_b = tempos[index + 1]
-                # A cue exactly at b is handled by the next segment (its
-                # cumulative value); here cue_tick is strictly inside (a, b).
-                # Average tempo over [a, cue_tick] for a linear tempo ramp:
-                # (tempo(a) + tempo(cue_tick)) / 2.
-                average = tempo_a + Fraction(
-                    (tempo_b - tempo_a) * distance, 2 * (b - a)
-                )
-                elapsed += average * Fraction(distance, tpq)
-
+        elapsed = tempo_map.time_at(cue_tick)
         time_nanoseconds = _round_half_even(elapsed * 1000)
         sample_frame = _round_half_even(
             elapsed * sample_rate / Fraction(1_000_000)
@@ -408,5 +536,132 @@ def _project(
                 "sample_frame": sample_frame,
             }
         )
-
     return results
+
+
+def _project_plan(
+    *,
+    tempo_map: TempoMap,
+    sample_rate: int,
+    cues: list[tuple[Any, int]],
+    entries: list[tuple[int, int, int]],
+) -> list[dict[str, Any]]:
+    """Project cues along a playback plan onto one continuous clock.
+
+    Entries are played in request order, each ``repeats`` times; within an
+    occurrence the cues keep their original request order.  The clock carries
+    the *unrounded* exact time forward, including across cue-free segments and
+    backward jumps in the score, so it never stalls or reverses.  Nanoseconds
+    and sample frames are rounded half-to-even only at the very end.
+    """
+    # Cues belonging to each half-open interval, kept in their original
+    # request order.  Lookups use a tick-sorted index; a cue at an end tick
+    # stays out of that half-open interval (bisect_left).
+    order_by_tick = sorted(range(len(cues)), key=lambda i: cues[i][1])
+    sorted_ticks = [cues[i][1] for i in order_by_tick]
+    by_interval: list[list[tuple[Any, int]]] = []
+    for start, end, _repeats in entries:
+        left = bisect_left(sorted_ticks, start)
+        right = bisect_left(sorted_ticks, end)
+        inside = sorted((order_by_tick[i] for i in range(left, right)))
+        by_interval.append([cues[i] for i in inside])
+
+    clock = Fraction(0)  # exact elapsed microseconds
+    occurrences: list[dict[str, Any]] = []
+    for entry_index, (start, end, repeats) in enumerate(entries):
+        # Duration is a property of the score interval and never changes, even
+        # when the plan jumps backward or repeats the same passage.
+        duration = tempo_map.segment_duration(start, end)
+        entry_start = clock
+        interval_cues = by_interval[entry_index]
+        for repeat in range(repeats):
+            repeat_start = clock
+            for cue_id, cue_tick in interval_cues:
+                offset = tempo_map.segment_duration(start, cue_tick)
+                elapsed = repeat_start + offset
+                occurrences.append(
+                    {
+                        ID_FIELD: cue_id,
+                        TICK_FIELD: cue_tick,
+                        PLAN_ENTRY_FIELD: entry_index,
+                        REPEAT_FIELD: repeat,
+                        "time_nanoseconds": _round_half_even(elapsed * 1000),
+                        "sample_frame": _round_half_even(
+                            elapsed * sample_rate / Fraction(1_000_000)
+                        ),
+                    }
+                )
+            clock += duration
+        # Guard against logic drift; validation bounds the occurrence count.
+        if clock < entry_start:
+            raise TimelineError("playback clock moved backwards")
+    return occurrences
+
+
+class TempoMap:
+    """Exact score-time mapping: tick -> elapsed microseconds since tick 0.
+
+    Segment durations are integrated with :class:`fractions.Fraction`; the
+    returned values are never rounded, so they can be accumulated across many
+    segments (including silent ones) without drift.
+    """
+
+    def __init__(
+        self, ticks_per_quarter: int, points: list[tuple[int, int, str]]
+    ) -> None:
+        self.ticks_per_quarter = ticks_per_quarter
+        self.ticks = [point[0] for point in points]
+        self.tempos = [point[1] for point in points]
+        self.modes = [point[2] for point in points]
+        self.last_index = len(points) - 1
+
+        # Exact cumulative microseconds at every tempo point.
+        cumulative: list[Fraction] = [Fraction(0)]
+        for i in range(len(points) - 1):
+            a, b = self.ticks[i], self.ticks[i + 1]
+            span = b - a
+            if self.modes[i] == MODE_CONSTANT:
+                segment = Fraction(self.tempos[i] * span, ticks_per_quarter)
+            else:
+                # Trapezoid: tempo ramps linearly from tempos[i] to tempos[i+1].
+                segment = Fraction(
+                    (self.tempos[i] + self.tempos[i + 1]) * span,
+                    2 * ticks_per_quarter,
+                )
+            cumulative.append(cumulative[-1] + segment)
+        self.cumulative = cumulative
+
+    def time_at(self, cue_tick: int) -> Fraction:
+        """Exact elapsed microseconds at ``cue_tick`` (never negative)."""
+        index = bisect_right(self.ticks, cue_tick) - 1
+        a = self.ticks[index]
+        tempo_a = self.tempos[index]
+        elapsed: Fraction = self.cumulative[index]
+
+        if cue_tick > a:
+            distance = cue_tick - a
+            if index == self.last_index or self.modes[index] == MODE_CONSTANT:
+                # Last point holds its tempo forever.
+                elapsed += Fraction(
+                    tempo_a * distance, self.ticks_per_quarter
+                )
+            else:
+                b = self.ticks[index + 1]
+                tempo_b = self.tempos[index + 1]
+                # A cue exactly at b is handled by the next segment (its
+                # cumulative value); here cue_tick is strictly inside (a, b).
+                # Average tempo over [a, cue_tick] for a linear tempo ramp:
+                # (tempo(a) + tempo(cue_tick)) / 2.
+                average = tempo_a + Fraction(
+                    (tempo_b - tempo_a) * distance, 2 * (b - a)
+                )
+                elapsed += average * Fraction(
+                    distance, self.ticks_per_quarter
+                )
+        return elapsed
+
+    def segment_duration(self, start_tick: int, end_tick: int) -> Fraction:
+        """Exact duration of the half-open segment ``[start_tick, end_tick)``."""
+        if end_tick < start_tick:
+            raise TimelineError("segment end tick precedes start tick")
+        return self.time_at(end_tick) - self.time_at(start_tick)

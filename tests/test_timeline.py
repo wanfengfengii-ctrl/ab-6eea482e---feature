@@ -380,5 +380,258 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(body1, body2)
 
 
+def plan_payload(entries, cues=None, **overrides):
+    payload = {**BASE, **overrides}
+    payload["cues"] = cues if cues is not None else [cue("a", 0), cue("b", 480)]
+    payload["playback_plan"] = entries
+    return payload
+
+
+def entry(start, end, repeats):
+    return {"start_tick": start, "end_tick": end, "repeats": repeats}
+
+
+def occurrences(payload):
+    status, body = validate_and_project(payload)
+    if status != 200:
+        raise AssertionError(f"plan projection failed: {body}")
+    assert "cues" not in body
+    return body["occurrences"]
+
+
+class PlaybackPlanTests(unittest.TestCase):
+    def test_basic_repeats_and_entries(self):
+        payload = plan_payload([entry(0, 480, 2), entry(480, 960, 1)])
+        result = occurrences(payload)
+        self.assertEqual(
+            [
+                (o["id"], o["tick"], o["plan_entry"], o["repeat"])
+                for o in result
+            ],
+            [("a", 0, 0, 0), ("a", 0, 0, 1), ("b", 480, 1, 0)],
+        )
+        # Constant 500000us/quarter: each [0,480) is 0.5s; [480,960) is 0.5s.
+        self.assertEqual([o["time_nanoseconds"] for o in result],
+                         [0, 500_000_000, 1_000_000_000])
+        self.assertEqual([o["sample_frame"] for o in result],
+                         [0, 24_000, 48_000])
+
+    def test_response_shape_when_enabled(self):
+        status, body = validate_and_project(
+            plan_payload([entry(0, 480, 1)])
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("occurrences", body)
+        self.assertNotIn("cues", body)
+        self.assertEqual(body["ticks_per_quarter"], 480)
+
+    def test_omitted_plan_is_unchanged(self):
+        payload = {**BASE, "cues": [cue("a", 480)]}
+        status, body = validate_and_project(payload)
+        self.assertEqual(status, 200)
+        self.assertIn("cues", body)
+        self.assertNotIn("occurrences", body)
+        self.assertEqual(
+            body["cues"][0],
+            {"id": "a", "tick": 480,
+             "time_nanoseconds": 500_000_000, "sample_frame": 24_000},
+        )
+
+    def test_order_entry_repeat_original_cue_order(self):
+        # Cues deliberately unsorted; original request order must be kept
+        # inside each occurrence.
+        cues = [cue("late", 480), cue("early", 0), cue("mid", 240)]
+        payload = plan_payload([entry(0, 960, 2)], cues=cues)
+        result = occurrences(payload)
+        self.assertEqual(
+            [(o["id"], o["plan_entry"], o["repeat"]) for o in result],
+            [
+                ("late", 0, 0), ("early", 0, 0), ("mid", 0, 0),
+                ("late", 0, 1), ("early", 0, 1), ("mid", 0, 1),
+            ],
+        )
+
+    def test_half_open_interval_boundary(self):
+        cues = [cue("at-start", 0), cue("inside", 240), cue("at-end", 480)]
+        payload = plan_payload(
+            [entry(0, 480, 1), entry(480, 960, 1)], cues=cues
+        )
+        result = occurrences(payload)
+        self.assertEqual(
+            [(o["id"], o["plan_entry"]) for o in result],
+            [("at-start", 0), ("inside", 0), ("at-end", 1)],
+        )
+
+    def test_clock_carries_across_cue_free_segments(self):
+        # tpq=3, constant 1us/quarter => each tick is 1/3 us.
+        points = [
+            {"tick": i, "microseconds_per_quarter": 1, "mode": "constant"}
+            for i in range(300)
+        ]
+        payload = plan_payload(
+            [entry(0, 150, 2), entry(150, 300, 1)],
+            cues=[cue("x", 150)],
+            ticks_per_quarter=3,
+            sample_rate=3_000_000,
+            tempo_points=points,
+        )
+        result = occurrences(payload)
+        # Two silent 50us entries, then the cue: 100us exact.
+        self.assertEqual(result[0]["time_nanoseconds"], 100_000)
+        self.assertEqual(result[0]["sample_frame"], 300)
+
+    def test_backward_jump_keeps_clock_continuous(self):
+        points = [
+            {"tick": i, "microseconds_per_quarter": 1, "mode": "constant"}
+            for i in range(300)
+        ]
+        payload = plan_payload(
+            [entry(200, 300, 1), entry(0, 100, 2), entry(0, 2, 1)],
+            cues=[cue("a", 0), cue("b", 1), cue("c", 100)],
+            ticks_per_quarter=3,
+            sample_rate=3_000_000,
+            tempo_points=points,
+        )
+        result = occurrences(payload)
+        ns = [o["time_nanoseconds"] for o in result]
+        frames = [o["sample_frame"] for o in result]
+        self.assertEqual(ns, sorted(ns))
+        self.assertEqual(frames, sorted(frames))
+        # First entry [200,300) has no cues but still consumes 100/3 us.
+        # Entry 1 repeat 0 starts at 100/3 us: cue a there, cue b +1/3 us.
+        self.assertEqual(result[0]["id"], "a")
+        self.assertEqual(result[0]["plan_entry"], 1)
+        self.assertAlmostEqual(result[0]["time_nanoseconds"], 33_333, delta=1)
+
+    def test_overlapping_and_duplicate_entries_are_allowed(self):
+        payload = plan_payload(
+            [entry(0, 480, 1), entry(0, 480, 1), entry(240, 960, 1)],
+            cues=[cue("a", 0), cue("b", 480)],
+        )
+        result = occurrences(payload)
+        self.assertEqual(
+            [(o["id"], o["plan_entry"], o["repeat"]) for o in result],
+            [("a", 0, 0), ("a", 1, 0), ("b", 2, 0)],
+        )
+        # 0.5s + 0.5s to reach the last entry; cue b is 0.25s into
+        # [240,960) (tick 480 - tick 240 at 500000us/quarter) => 1.25s.
+        self.assertEqual(result[-1]["time_nanoseconds"], 1_250_000_000)
+
+    def test_linear_ramp_segment_durations(self):
+        points = [
+            {"tick": 0, "microseconds_per_quarter": 600000, "mode": "linear"},
+            {"tick": 480, "microseconds_per_quarter": 200000, "mode": "constant"},
+        ]
+        payload = plan_payload(
+            [entry(0, 480, 1), entry(480, 960, 1)],
+            cues=[cue("mid", 240), cue("end", 480)],
+            tempo_points=points,
+        )
+        result = {o["id"]: o for o in occurrences(payload)}
+        # Ramp [0,480) trapezoid = 400000us; midpoint = 250000us.
+        self.assertEqual(result["mid"]["time_nanoseconds"], 250_000_000)
+        # [480,960) at constant 200000us = 200000us after the 400000us ramp.
+        self.assertEqual(result["end"]["time_nanoseconds"], 400_000_000)
+
+    def test_cues_outside_every_interval_never_occur(self):
+        payload = plan_payload([entry(0, 10, 1)], cues=[cue("far", 9999)])
+        self.assertEqual(occurrences(payload), [])
+
+    def test_expansion_cap_boundary(self):
+        # 2000 cues repeated twice = 4000 (allowed); three times = 6000 (denied).
+        cues = [cue(i, 0) for i in range(2000)]
+        self.assertEqual(len(occurrences(plan_payload([entry(0, 10, 2)], cues=cues))), 4000)
+        errors = errors_for(plan_payload([entry(0, 10, 3)], cues=cues))
+        self.assertIn(
+            ("PLAN_TOO_LARGE", "/playback_plan"),
+            {(e["code"], e["path"]) for e in errors},
+        )
+
+    def test_errors_never_carry_occurrences(self):
+        status, body = validate_and_project(
+            plan_payload([entry(10, 5, 1)])  # end <= start
+        )
+        self.assertEqual(status, 400)
+        self.assertNotIn("occurrences", body)
+        self.assertNotIn("cues", body)
+
+
+class PlaybackPlanValidationTests(unittest.TestCase):
+    def assert_code_at(self, entries, code, path, cues=None):
+        errors = errors_for(plan_payload(entries, cues=cues))
+        matches = [e for e in errors if e["code"] == code and e["path"] == path]
+        self.assertTrue(matches, f"expected {code} at {path}, got {errors}")
+
+    def test_plan_type_and_count(self):
+        self.assert_code_at("nope", "INVALID_TYPE", "/playback_plan")  # type: ignore[arg-type]
+        self.assert_code_at([], "INVALID_COUNT", "/playback_plan")
+        too_many = [entry(0, 1, 1) for _ in range(65)]
+        self.assert_code_at(too_many, "INVALID_COUNT", "/playback_plan")
+
+    def test_entry_must_be_object(self):
+        self.assert_code_at([42], "INVALID_TYPE", "/playback_plan/0")
+
+    def test_missing_fields(self):
+        self.assert_code_at(
+            [{"start_tick": 0, "end_tick": 480}],
+            "MISSING_FIELD", "/playback_plan/0/repeats",
+        )
+        self.assert_code_at(
+            [{"end_tick": 480, "repeats": 1}],
+            "MISSING_FIELD", "/playback_plan/0/start_tick",
+        )
+
+    def test_type_and_bool_rejection(self):
+        self.assert_code_at(
+            [{"start_tick": True, "end_tick": "1", "repeats": 1.0}],
+            "INVALID_TYPE", "/playback_plan/0/start_tick",
+        )
+        self.assert_code_at(
+            [{"start_tick": 0, "end_tick": "1", "repeats": 1.0}],
+            "INVALID_TYPE", "/playback_plan/0/end_tick",
+        )
+        self.assert_code_at(
+            [{"start_tick": 0, "end_tick": 1, "repeats": True}],
+            "INVALID_TYPE", "/playback_plan/0/repeats",
+        )
+
+    def test_negative_ticks(self):
+        self.assert_code_at(
+            [entry(-1, 480, 1)],
+            "PLAN_TICK_OUT_OF_RANGE", "/playback_plan/0/start_tick",
+        )
+        self.assert_code_at(
+            [entry(0, -2, 1)],
+            "PLAN_TICK_OUT_OF_RANGE", "/playback_plan/0/end_tick",
+        )
+
+    def test_invalid_intervals(self):
+        for bad_end in (100, 0):
+            self.assert_code_at(
+                [entry(100, bad_end, 1)],
+                "INVALID_INTERVAL", "/playback_plan/0/end_tick",
+            )
+
+    def test_repeats_range(self):
+        self.assert_code_at(
+            [entry(0, 1, 0)], "REPEATS_OUT_OF_RANGE", "/playback_plan/0/repeats"
+        )
+        self.assert_code_at(
+            [entry(0, 1, 17)], "REPEATS_OUT_OF_RANGE", "/playback_plan/0/repeats"
+        )
+
+    def test_unknown_field(self):
+        self.assert_code_at(
+            [{"start_tick": 0, "end_tick": 1, "repeats": 1, "extra": 9}],
+            "UNKNOWN_FIELD", "/playback_plan/0/extra",
+        )
+
+    def test_plan_errors_are_deterministic(self):
+        payload = plan_payload([entry(5, 5, 17)])
+        _, body1 = validate_and_project(payload)
+        _, body2 = validate_and_project(payload)
+        self.assertEqual(body1, body2)
+
+
 if __name__ == "__main__":
     unittest.main()
